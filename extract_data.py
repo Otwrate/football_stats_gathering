@@ -1,5 +1,7 @@
 import glob
 import os
+
+import PIL
 import numpy as np
 from logging import warn, warning
 from pathlib import PurePath, Path
@@ -12,14 +14,16 @@ import pandas as pd
 
 
 class DatasetBuilder(torch.utils.data.Dataset):
-    def __init__(self, path=None, annotation_path=None, dataset=None, mapper={'person': 0,
-                                                                              'hand': 1,
-                                                                              'foot': 2,
-                                                                              'person': 3,
-                                                                              'head': 4,
-                                                                              'person-like': 5
-                                                                              }, transforms=None):
+    def __init__(self, path, image_output_shape=(800, 600), annotation_path=None, dataset=None, mapper={'person': 0,
+                                                                                                        'hand': 1,
+                                                                                                        'foot': 2,
+                                                                                                        'person': 3,
+                                                                                                        'head': 4,
+                                                                                                        'person-like': 5
+                                                                                                        },
+                 transforms=None):
 
+        self.image_output_shape = image_output_shape
         self.transforms = transforms
         self.annotation_path = os.path.join(path, 'Annotations')
         self.data_path = path
@@ -45,32 +49,49 @@ class DatasetBuilder(torch.utils.data.Dataset):
         img = self.dataset[idx][0]
         img_idx = self.dataset.samples[idx][0].split('\\')[-1].strip('.jpg')
         pedestrians = self.pedestrians.loc[img_idx]
-        targets = []
-        items = pedestrians.reset_index().T.to_dict()
-        for k, v in items.items():
-            targets.append({
-                # 'boxes': {'bndbox_xmin': torch.as_tensor(np.float32(v['bndbox_xmin']), dtype=torch.float32),
-                #           'bndbox_ymin': torch.as_tensor(np.float32(v['bndbox_ymin']), dtype=torch.float32),
-                #           'bndbox_xmax': torch.as_tensor(np.float32(v['bndbox_xmax']), dtype=torch.float32),
-                #           'bndbox_ymax': torch.as_tensor(np.float32(v['bndbox_ymax']), dtype=torch.float32)},
-                'boxes': torch.as_tensor(np.array([(np.float32(v['bndbox_xmin'])),
-                                                    (np.float32(v['bndbox_ymin'])),
-                                                   (np.float32(v['bndbox_xmax'])),
-                                                    (np.float32(v['bndbox_ymax']))])),
-                'lables': 1})
-        bboxes = pedestrians[['bndbox_xmin', 'bndbox_ymin', 'bndbox_xmax', 'bndbox_ymax']].astype(np.float32).values
-        bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
-        occlusion = pedestrians['occluded']  # .astype(np.float32)
-        img = np.array(img)
-        try:
-            occlusion = torch.as_tensor(occlusion, dtype=torch.float32)
-        except TypeError:
-            occlusion = torch.zeros(bboxes.shape[0])
+        target = {}
+        bboxes = torch.as_tensor(
+            pedestrians[['bndbox_xmin','bndbox_ymin','bndbox_xmax','bndbox_ymax']].values.astype(np.float32),
+            dtype=torch.float32)
+        img, bboxes = self.scale(img, bboxes, self.image_output_shape)
+
+        labels = torch.ones((pedestrians.shape[0],), dtype=torch.int64)
+        image_id = pedestrians.index[0]
+        area = (bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0])
+        is_crowd = torch.as_tensor(pedestrians[['occluded']].values.astype(np.float32), dtype=torch.float32)
+
+        target["boxes"] = bboxes
+        target["labels"] = labels
+        target["image_id"] = image_id
+        target["area"] = area
+        target["iscrowd"] = is_crowd
+
+
+        # items = pedestrians.reset_index().T.to_dict()
+        # for k, v in items.items():
+        #     targets.append({
+        #         # 'boxes': {'bndbox_xmin': torch.as_tensor(np.float32(v['bndbox_xmin']), dtype=torch.float32),
+        #         #           'bndbox_ymin': torch.as_tensor(np.float32(v['bndbox_ymin']), dtype=torch.float32),
+        #         #           'bndbox_xmax': torch.as_tensor(np.float32(v['bndbox_xmax']), dtype=torch.float32),
+        #         #           'bndbox_ymax': torch.as_tensor(np.float32(v['bndbox_ymax']), dtype=torch.float32)},
+        #         'boxes': torch.as_tensor(np.array([(np.float32(v['bndbox_xmin'])),
+        #                                             (np.float32(v['bndbox_ymin'])),
+        #                                            (np.float32(v['bndbox_xmax'])),
+        #                                             (np.float32(v['bndbox_ymax']))])),
+        #         'lables': 1})
+        # bboxes = pedestrians[['bndbox_xmin', 'bndbox_ymin', 'bndbox_xmax', 'bndbox_ymax']].astype(np.float32).values
+        # bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
+        # occlusion = pedestrians['occluded']  # .astype(np.float32)
+        # img = np.array(img)
+        # try:
+        #     occlusion = torch.as_tensor(occlusion, dtype=torch.float32)
+        # except TypeError:
+        #     occlusion = torch.zeros(bboxes.shape[0])
         # target['boxes'] = bboxes
         # target['occlusion'] = occlusion
         if self.transforms is not None:
-            img, target = self.transforms(img, targets)
-        return torch.from_numpy(np.array(img)).reshape([img.shape[2], img.shape[1], img.shape[0]]), targets
+            img, target = self.transforms(img, target)
+        return img, target
 
     def __len__(self):
         return len(self.dataset)
@@ -132,18 +153,30 @@ class DatasetBuilder(torch.utils.data.Dataset):
                                               'bndbox_ymax': bndbox_ymax,
                                               }, ignore_index=True)
 
-        # except AttributeError as E:
-        #     print(E)
-
     def __get_dataset(self):
         _ = self.__get_annotations()
         self.__get_data()
         pass
 
+    def scale(self, image: PIL.Image, bboxes: torch.tensor, target_size: tuple):
+        transform = torchvision.transforms.Resize((target_size[1], target_size[0]), interpolation=2)
+        original_size = image.size
+        scale_x = target_size[0] / original_size[0]
+        scale_y = target_size[1] / original_size[1]
+        new_boxes = []
+        if len(bboxes.shape) == 1:
+            new_boxes.append((bboxes[0] * scale_x, bboxes[1] * scale_y, bboxes[2] * scale_x, bboxes[3] * scale_y))
+        else:
+            for bbox in bboxes:
+                new_boxes.append((bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y))
+        new_boxes = torch.as_tensor(new_boxes, dtype=torch.float32)
+        out_img = transform(image)
+        return out_img, new_boxes
+
 
 if __name__ == '__main__':
     train_path = r'datatsets/pedestrians/Train/Train/'
     train_dataset = Dataset.ImageFolder(train_path, )
-    train = DatasetBuilder(train_path)
+    train = DatasetBuilder(path=train_path)
     train.__getitem__(3)
     pass
